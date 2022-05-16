@@ -17,31 +17,37 @@
 #define SHIFT_DATA    2
 #define SHIFT_LATCH   3
 #define SHIFT_CLOCK   4
-#define SERVO_SIGNAL  5
+
+#define SERVO_SIGNAL  1
+
 #define RFID_RESET    6
-#define OLED_RESET    7
-#define OLED_DC       8
-#define OLED_SS       9
-#define RFID_SS       10
+#define RFID_SDA      5
+
+#define OLED_RESET    8
+#define OLED_DC       9
+#define OLED_SS       10
+
 #define A_IN          A5
+
+void copy(bool* src, bool* dst, int len);
 
 ShiftRegister74HC595<1> sr(SHIFT_DATA, SHIFT_CLOCK, SHIFT_LATCH);
 Servo servo;
-MFRC522 rfid(RFID_SS, RFID_RESET);
+MFRC522 rfid(RFID_SDA, RFID_RESET);
 Adafruit_SSD1331 display = Adafruit_SSD1331(&SPI, OLED_SS, OLED_DC, OLED_RESET);
 
 const int PRICE_PER_MINUTE = 10;
 
 String CARDS[1][2] = {
-  {"0", "00"}  
+  {" 93 B7 1F 07", "3000"}  
 };
 
 bool park_status[4] = {false, false, false, false};
-bool park_status_cache[4] = {park_status};
+bool cache[4];
 unsigned long park_timer[4] = {0,0,0,0};
+int status;
 
 void setup() {
-
   servo.attach(SERVO_SIGNAL);
   Serial.begin(9600);
   SPI.begin();
@@ -49,31 +55,60 @@ void setup() {
   rfid.PCD_Init();
   
   display.fillScreen(BLACK);
+  sr.setAllLow();
+  servo.write(0);
+
+  readLdrData();
+  updateLEDs();
+  displayEmptySpace();
+  update_cache();
 }
 
 void loop() {
+  update_cache();
   readLdrData();
-  updateLEDs();
-  updateTimers();
-  displayEmptySpace();
+  
+  if (isChanged()) {
+    for (int i = 0; i < 4; i++) {
+      if (park_status[i] != cache[i]) {
+        if (park_status[i] && !cache[i]) {
+          Serial.println("update");
+          Serial.println(i);
+          updateTimer(i);
+          updateLEDs();
+          displayEmptySpace();
+        }
+        else if (!park_status[i] && cache[i]) {
+          auto duration = millis() - park_timer[i];
+          int price = getPrice(duration); 
+          
+          bool found = false;
+          while (!found) {
+            displayPrice(price);
 
-  if (checkStatus() != -1) {
-    readLdrData();
-    updateLEDs();
-    updateTimers();
+            String card = readCard();
+            found = updateBalance(card, price);
 
-    displayPrice(checkStatus());
-    bool found = updateBalance(readCard(), getPrice(checkStatus()));
-    if (!found) displayCNF();
-    else openGate();
+            if (!found) {
+              displayCNF();
+              delay(2000);
+            }
+          }
+          resetTimer(i);
+          openGate();
+          displayEmptySpace();
+          updateLEDs();
+        } 
+      }
+    }
   }
 }
 
-int checkStatus() {
+bool isChanged() {
   for (int i = 0; i < 4; i++) {
-    if (park_status_cache[i] != park_status[i]) return i;
+    if (park_status[i] != cache[i]) return true;
   }
-  return -1;
+  return false;
 }
 
 void readLdrData() {
@@ -82,7 +117,8 @@ void readLdrData() {
       sr.set(i, HIGH);
       
       int ldr_val = analogRead(A_IN);
-      if (ldr_val > 200) park_status[i] = false;
+      
+      if (ldr_val > 100) park_status[i] = false;
       else park_status[i] = true;
 
       sr.set(i, LOW);
@@ -91,27 +127,22 @@ void readLdrData() {
 
 void updateLEDs() {
     for (int i = 0; i < 4; i++) {
-      
-      if (park_status[i]) digitalWrite(i+4, HIGH);
-      else digitalWrite(i+4, LOW);
-        
+      if (!park_status[i]) sr.set(i+4, HIGH);
+      else sr.set(i+4, LOW); 
     }
+    Serial.println("LEDs Updated!");
 }
 
-void updateTimers() {
-  for (int i = 0; i < 4; i++) {
-    if (park_status[i] && park_timer[i] == 0) park_timer[i] = millis();
-    else if (!park_status && park_timer[i] != 0) park_timer[i] = 0;
-  }
+void updateTimer(int timer) { 
+  park_timer[timer] = millis();
 }
 
-void resetTimers() {
-  for (int i = 0; i < 4; i++) park_timer[i] = 0;
+void resetTimer(int timer) { 
+  park_timer[timer] = 0;
 }
 
-int getPrice(int park_num) {
-  unsigned long elapsed_time = millis() - park_timer[park_num];
-  unsigned long et_mins = round((elapsed_time / 1000) / 60);
+int getPrice(int elapsed_time) {
+  unsigned long et_mins = round((elapsed_time / 2000));
   int price = PRICE_PER_MINUTE * et_mins;
 
   return price;
@@ -119,52 +150,55 @@ int getPrice(int park_num) {
 
 String readCard() {
 
-  bool card_present = rfid.PICC_IsNewCardPresent();
-  bool card_select = rfid.PICC_ReadCardSerial();
+  while (true) {
+    // Look for new cards
+    if (!rfid.PICC_IsNewCardPresent()) 
+    {
+      continue;
+    }
+    // Select one of the cards
+    if (!rfid.PICC_ReadCardSerial()) 
+    {
+      continue;
+    }
 
-  while (!card_present && !card_select) {
-
-    card_present = rfid.PICC_IsNewCardPresent();
-    card_select = rfid.PICC_ReadCardSerial();
+    String content = "";
     
+    for (byte i = 0; i < rfid.uid.size; i++) 
+    {
+       content.concat(String(rfid.uid.uidByte[i] < 0x10 ? " 0" : " "));
+       content.concat(String(rfid.uid.uidByte[i], HEX));
+    }
+    
+    content.toUpperCase();
+    return content;
   }
-
-  String UID = "";
-  
-  for (byte i = 0; i < rfid.uid.size; i++) 
-  {
-     UID.concat(String(rfid.uid.uidByte[i] < 0x10 ? " 0" : " "));
-     UID.concat(String(rfid.uid.uidByte[i], HEX));
-  }
-  
-  UID.toUpperCase();
-
-  return UID;
 }
 
 bool updateBalance(String card_uid, int price) {
   bool found = false;
-  for (int i = 0; i < sizeof(CARDS) / sizeof(int); i++) {
+  for (int i = 0; i < (sizeof(CARDS) / sizeof(*CARDS)); i++) {
     if (CARDS[i][0] == card_uid) {
       found = true;
-      CARDS[i][1] -= price;  
+      CARDS[i][1] = String(CARDS[i][1].toInt() - price);
+      Serial.println("New Balance: " + String(CARDS[i][1]));
     }
   }
 
   return found;
 }
 
-void displayPrice(int park_num) {
+void displayPrice(int price) {
   display.fillScreen(BLACK);
-  display.setCursor(display.width() / 2, display.height() / 2);
+  display.setCursor(10, 10);
   display.setTextSize(2);
   display.setTextColor(WHITE);
-  display.print(String(getPrice(park_num)) + " TL");
+  display.print(String(price) + " TL");
 }
 
 void displayCNF() {
   display.fillScreen(BLACK);
-  display.setCursor(display.width() / 2, display.height() / 2);
+  display.setCursor(10, 10);
   display.setTextSize(2);
   display.setTextColor(WHITE);
   display.print("CARD NOT FOUND!");
@@ -172,19 +206,18 @@ void displayCNF() {
 
 void displayEmptySpace() {
   display.fillScreen(BLACK);
-
   for (int i = 0; i < 4; i++) {
-    if (park_status[i]) {
+    if (!park_status[i]) {
       if (i == 0) display.fillRect(5, 5, (display.width() / 2 - 5), (display.height() / 2 - 5), GREEN);
       else if (i == 1) display.fillRect((display.width() / 2 + 5), 5, display.width() - 5, (display.height() / 2 - 5), GREEN);
-      else if (i == 0) display.fillRect(5, (display.height() / 2 + 5) , (display.width() / 2 - 5), display.height() - 5, GREEN);
-      else if (i == 0) display.fillRect((display.width() / 2 + 5), (display.height() / 2 + 5) , display.width() - 5, display.height() - 5, GREEN);
+      else if (i == 2) display.fillRect(5, (display.height() / 2 + 5) , (display.width() / 2 - 5), display.height() - 5, GREEN);
+      else if (i == 3) display.fillRect((display.width() / 2 + 5), (display.height() / 2 + 5) , display.width() - 5, display.height() - 5, GREEN);
     }
     else {
       if (i == 0) display.fillRect(5, 5, (display.width() / 2 - 5), (display.height() / 2 - 5), RED);
       else if (i == 1) display.fillRect((display.width() / 2 + 5), 5, display.width() - 5, (display.height() / 2 - 5), RED);
-      else if (i == 0) display.fillRect(5, (display.height() / 2 + 5) , (display.width() / 2 - 5), display.height() - 5, RED);
-      else if (i == 0) display.fillRect((display.width() / 2 + 5), (display.height() / 2 + 5) , display.width() - 5, display.height() - 5, RED);
+      else if (i == 2) display.fillRect(5, (display.height() / 2 + 5) , (display.width() / 2 - 5), display.height() - 5, RED);
+      else if (i == 3) display.fillRect((display.width() / 2 + 5), (display.height() / 2 + 5) , display.width() - 5, display.height() - 5, RED);
     }
   }
 }
@@ -193,4 +226,10 @@ void openGate() {
   servo.write(90);
   delay(5000);
   servo.write(0);
+}
+
+void update_cache() {
+  for (int i = 0; i < 4; i++) {
+    cache[i] = park_status[i];  
+  }
 }
